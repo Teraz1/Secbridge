@@ -1,0 +1,14 @@
+{
+  "formats": [
+    { "id": "sangfor-src",   "format": "src=$src$ "    },
+    { "id": "sangfor-dst",   "format": "dst=$dst$ "    },
+    { "id": "sangfor-act",   "format": "act=$act$ "    },
+    { "id": "sangfor-app",   "format": "app=$app$ "    },
+    { "id": "sangfor-proto", "format": "proto=$proto$ " },
+    { "id": "sangfor-suser", "format": "suser=$suser$ " },
+    { "id": "sangfor-spt",   "format": "spt=$spt$ "    },
+    { "id": "sangfor-dpt",   "format": "dpt=$dpt$ "    },
+    { "id": "sangfor-out",   "format": "out=$out$ "    },
+    { "id": "sangfor-in",    "format": "in=$in$ "      }
+  ]
+}

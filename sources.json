@@ -1,0 +1,38 @@
+{
+  "secbridge": {
+    "version": "1.0",
+    "description": "SecBridge multi-source syslog routing config. Add new sources here and run: sudo bash scripts/manage-sources.sh apply",
+
+    "destination": {
+      "type": "sentinelone_sdl",
+      "ingest_url": "",
+      "api_key": ""
+    },
+
+    "sources": [
+      {
+        "id": "001",
+        "enabled": true,
+        "name": "Sangfor NGAF",
+        "product": "sangfor-ngaf",
+        "description": "Sangfor Next-Generation Application Firewall",
+        "allowed_ips": [],
+        "syslog_port": 514,
+        "protocol": "udp",
+        "log_file": "sangfor-ngaf.log",
+        "parsed_log_file": "sangfor-ngaf-parsed.log",
+        "parser_script": "/opt/sangfor-s1-kit/parser/sangfor_parser.py",
+        "parser_name": "sangfor-ngaf",
+        "log_type": "firewall"
+      }
+    ],
+
+    "notes": [
+      "allowed_ips: list of IPs allowed to send syslog to this collector (empty = allow all)",
+      "syslog_port: each source MUST use a unique port if running on the same collector",
+      "protocol: udp or tcp or both",
+      "parser_script: path to the Python parser for this source",
+      "To add a new source: copy a source block above, change id/name/product/port, then run manage-sources.sh apply"
+    ]
+  }
+}
