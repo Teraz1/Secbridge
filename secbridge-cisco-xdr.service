@@ -1,0 +1,18 @@
+[Unit]
+Description=SecBridge — Cisco XDR Shipper
+Documentation=https://github.com/Teraz1/secbridge
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /opt/secbridge/cisco_xdr_shipper.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=secbridge-cisco-xdr
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+{
+  "_comment": "Cisco XDR credentials for SecBridge shipper. Get from: XDR Console → Administration → API Clients",
+  "client_id":     "YOUR_CLIENT_ID",
+  "client_secret": "YOUR_CLIENT_SECRET",
+  "region":        "us",
+  "_region_options": "us | eu | apjc"
+}
