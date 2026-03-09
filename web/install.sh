@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
 # =============================================================================
-# SecBridge Web UI — Installer
-# Installs FastAPI backend + React frontend as systemd services
+# Sangfor NGAF → SentinelOne SDL — Collector Setup
+# Version: 3.1
+# Supports: Ubuntu 22.04, Ubuntu 24.04, Rocky Linux 9 / AlmaLinux 9
 #
-# Usage: sudo bash install.sh
-# Access: http://YOUR_IP:3000
+# Fixes in v3:
+#   BUG1 — deploy_parser_config() no longer looks for external file;
+#           creates /opt/config/sangfor-ngaf-parser.json inline
+#   BUG2 — Unsupported installer flags removed; agent.json written ourselves
+#   BUG3 — configs.d dir created with mkdir -p before any copy attempt
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 
-INSTALL_DIR="/opt/secbridge/web"
-API_PORT=8000
-UI_PORT=3000
-LOG_FILE="/var/log/secbridge-web-install.log"
+AGENT_CONF="/etc/scalyr-agent-2/agent.json"
+PARSER_DIR="/etc/scalyr-agent-2/configs.d"
+OPT_CONFIG_DIR="/opt/config"
+PARSER_CONFIG_FILE="$OPT_CONFIG_DIR/sangfor-ngaf-parser.json"
+LOG_FILE="/var/log/sangfor-s1-install.log"
 
-init_log() {
+# FIX: init log file before any tee -a call.
+# Without this, tee -a fails if /var/log isn't writable (e.g. non-root run
+# before check_root fires), and set -e silently kills the script.
+init_logfile() {
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
   touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/dev/null"
 }
@@ -26,232 +34,292 @@ log()   { echo -e "${GREEN}[OK]${NC}  $1" | tee -a "$LOG_FILE"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $1" | tee -a "$LOG_FILE"; }
 error() { echo -e "${RED}[ERR]${NC} $1" | tee -a "$LOG_FILE"; exit 1; }
 info()  { echo -e "${BLUE}[INFO]${NC} $1" | tee -a "$LOG_FILE"; }
-title() { echo -e "\n${CYAN}── $1 ──${NC}"; }
 
-get_local_ip() {
-  ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' \
-    || ip addr show | awk '/inet / && !/127.0.0.1/{print $2}' | cut -d/ -f1 | head -1 \
-    || echo "YOUR_VM_IP"
-}
-
+# ── Banner ────────────────────────────────────────────────────────────────
 banner() {
   echo ""
   echo "============================================================"
-  echo "  SecBridge Web UI  |  Backend + Frontend Installer"
+  echo "  Sangfor NGAF → SentinelOne SDL  |  Setup Kit  v3.1"
   echo "============================================================"
   echo ""
 }
 
+# ── Checks ────────────────────────────────────────────────────────────────
 check_root() {
   [[ "$EUID" -ne 0 ]] && error "Run as root: sudo bash install.sh"
 }
 
 detect_os() {
-  [[ -f /etc/os-release ]] && . /etc/os-release || error "Cannot detect OS"
+  [[ -f /etc/os-release ]] && . /etc/os-release || error "Cannot detect OS."
   OS=$ID; VER=$VERSION_ID
-  info "OS: $OS $VER"
+  info "Detected OS: $OS $VER"
 }
 
-# ── Install system deps ───────────────────────────────────────────────────
-install_deps() {
-  title "Installing Dependencies"
-  case "$OS" in
-    ubuntu)
-      apt-get update -qq
-      apt-get install -y -qq python3 python3-pip curl nodejs npm >> "$LOG_FILE" 2>&1
-      ;;
-    rocky|rhel|centos|almalinux)
-      dnf install -y -q python3 python3-pip curl nodejs npm >> "$LOG_FILE" 2>&1
-      ;;
-    *)
-      error "Unsupported OS: $OS"
-      ;;
-  esac
-  log "System dependencies installed."
+# Portable IP — works on Ubuntu and Rocky (hostname -I is not portable)
+get_local_ip() {
+  ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' \
+    || ip addr show | awk '/inet / && !/127.0.0.1/{print $2}' | cut -d/ -f1 | head -1 \
+    || echo "<YOUR_VM_IP>"
 }
 
-# ── Install Python backend deps ───────────────────────────────────────────
-install_python_deps() {
-  title "Installing Python Dependencies"
-  pip install fastapi uvicorn python-multipart --break-system-packages \
-    >> "$LOG_FILE" 2>&1
-  log "FastAPI + Uvicorn installed."
+# ── Credentials prompt ────────────────────────────────────────────────────
+prompt_credentials() {
+  echo ""
+  echo "  ── SentinelOne Credentials ──────────────────────────────"
+  echo "  Get your Write API Key:"
+  echo "    S1 Console → Settings → API Keys → Log Access Keys → Add"
+  echo ""
+  read -rp "  S1 Write API Key: " S1_API_KEY
+  [[ -z "$S1_API_KEY" ]] && error "API key cannot be empty."
+
+  echo ""
+  echo "  Ingest URL (your region):"
+  echo "    https://xdr.us1.sentinelone.net"
+  echo "    https://xdr.eu1.sentinelone.net"
+  echo ""
+  read -rp "  S1 Ingest URL (include https://): " S1_URL
+  [[ -z "$S1_URL" ]] && error "Ingest URL cannot be empty."
+  S1_URL="${S1_URL%/}"  # strip trailing slash
+
+  read -rp "  Syslog listen port [default: 514]: " SYSLOG_PORT
+  SYSLOG_PORT="${SYSLOG_PORT:-514}"
+
+  read -rp "  Collector hostname label [default: sangfor-collector]: " SERVER_HOST
+  SERVER_HOST="${SERVER_HOST:-sangfor-collector}"
+
+  echo ""
+  info "API Key : ${S1_API_KEY:0:8}... (truncated)"
+  info "URL     : $S1_URL"
+  info "Port    : $SYSLOG_PORT"
+  info "Host    : $SERVER_HOST"
 }
 
-# ── Install Node deps and build React ─────────────────────────────────────
-build_frontend() {
-  title "Building React Frontend"
-
-  # Install frontend deps and build production bundle
-  # FastAPI serves the dist/ directly — no separate 'serve' process needed
-  cd "$INSTALL_DIR/frontend"
-  npm install >> "$LOG_FILE" 2>&1
-  npm run build >> "$LOG_FILE" 2>&1
-
-  log "React frontend built at $INSTALL_DIR/frontend/dist"
+# ── Dependencies ──────────────────────────────────────────────────────────
+install_deps_ubuntu() {
+  info "Installing dependencies (Ubuntu)..."
+  apt-get update -qq
+  apt-get install -y -qq curl wget python3 python3-pip \
+    iproute2 netcat-openbsd >> "$LOG_FILE" 2>&1
+  log "Dependencies ready."
 }
 
-# ── Copy files to install dir ─────────────────────────────────────────────
-install_files() {
-  title "Installing Files"
+install_deps_rocky() {
+  info "Installing dependencies (Rocky/RHEL)..."
+  dnf install -y -q curl wget python3 python3-pip \
+    iproute nmap-ncat >> "$LOG_FILE" 2>&1
+  log "Dependencies ready."
+}
 
-  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-  REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# ── Scalyr Agent ──────────────────────────────────────────────────────────
+install_scalyr_agent() {
+  info "Installing Scalyr Agent 2 (SentinelOne Collector)..."
 
-  # Install web/ contents to /opt/secbridge/web/
-  mkdir -p "$INSTALL_DIR"
-  cp -r "$SCRIPT_DIR/." "$INSTALL_DIR/"
-  chmod +x "$INSTALL_DIR/install.sh"
+  if command -v scalyr-agent-2 &>/dev/null; then
+    warn "Scalyr Agent already installed — skipping install, updating config only."
+    return
+  fi
 
-  # Install repo root folders that backend.py depends on:
-  #   config/sources.json   → BASE_DIR/config/
-  #   scripts/              → BASE_DIR/scripts/
-  #   integrations/         → BASE_DIR/integrations/
-  BASE_INSTALL="$(dirname "$INSTALL_DIR")"   # /opt/secbridge
+  curl -fsSL \
+    https://www.scalyr.com/scalyr-repo/stable/latest/install-scalyr-agent-2.sh \
+    -o /tmp/install-scalyr.sh >> "$LOG_FILE" 2>&1 \
+    || error "Download failed. Check internet connectivity."
 
-  if [[ -d "$REPO_ROOT/config" ]]; then
-    mkdir -p "$BASE_INSTALL/config"
-    cp -rn "$REPO_ROOT/config/." "$BASE_INSTALL/config/" 2>/dev/null || true
-    log "config/ installed to $BASE_INSTALL/config/"
-  else
-    warn "config/ not found in repo root — create $BASE_INSTALL/config/sources.json manually"
-    mkdir -p "$BASE_INSTALL/config"
-    cat > "$BASE_INSTALL/config/sources.json" <<'SRCEOF'
+  # BUG2 FIX: run plain — no --set-scalyr-server / --set-api-key flags
+  # (those flags are not supported). We write our own agent.json after install.
+  bash /tmp/install-scalyr.sh >> "$LOG_FILE" 2>&1 \
+    || error "Scalyr Agent install failed. See: $LOG_FILE"
+
+  rm -f /tmp/install-scalyr.sh
+  log "Scalyr Agent 2 installed."
+}
+
+# ── agent.json ────────────────────────────────────────────────────────────
+# ── agent.json ────────────────────────────────────────────────────────────
+configure_agent() {
+  info "Writing /etc/scalyr-agent-2/agent.json ..."
+
+  [[ -f "$AGENT_CONF" ]] && \
+    cp "$AGENT_CONF" "${AGENT_CONF}.bak.$(date +%s)" && \
+    info "Backed up existing agent.json"
+
+  mkdir -p "$PARSER_DIR"
+
+  # Write valid JSON using Python — no heredoc, no control chars, no JS comments
+  python3 -c "
+import json
+data = {
+    'api_key': '${S1_API_KEY}',
+    'scalyr_server': '${S1_URL}',
+    'server_attributes': {
+        'serverHost': '${SERVER_HOST}',
+        'role': 'sangfor-ngaf-collector',
+        'version': '3.1'
+    },
+    'logs': [
+        {
+            'path': '/var/log/scalyr-agent-2/sangfor-ngaf.log',
+            'attributes': {
+                'parser': 'sangfor-ngaf',
+                'source': 'sangfor_firewall',
+                'log_format': 'raw_fwlog'
+            }
+        }
+    ],
+    'monitors': [
+        {
+            'module': 'scalyr_agent.builtin_monitors.syslog_monitor',
+            'protocols': 'udp:${SYSLOG_PORT}, tcp:${SYSLOG_PORT}',
+            'accept_remote_connections': True,
+            'message_log': 'sangfor-ngaf.log',
+            'parser': 'sangfor-ngaf',
+            'log_rotation_max_bytes': 20971520,
+            'log_rotation_backup_count': 5
+        }
+    ]
+}
+with open('/etc/scalyr-agent-2/agent.json', 'w') as f:
+    json.dump(data, f, indent=2)
+print('agent.json written OK')
+"
+  log "agent.json written to $AGENT_CONF"
+}
+
+create_parser_config() {
+  info "Creating parser config at $PARSER_CONFIG_FILE ..."
+
+  # BUG1 FIX: create /opt/config/ and write the file here — self-contained
+  mkdir -p "$OPT_CONFIG_DIR"
+
+  cat > "$PARSER_CONFIG_FILE" <<'EOF'
 {
-  "secbridge": {
-    "version": "1.0",
-    "destination": {"type": "sentinelone_sdl", "ingest_url": "", "api_key": ""},
-    "sources": []
-  }
+  "formats": [
+    { "id": "sangfor-src",   "format": "src=$src$ "   },
+    { "id": "sangfor-dst",   "format": "dst=$dst$ "   },
+    { "id": "sangfor-act",   "format": "act=$act$ "   },
+    { "id": "sangfor-app",   "format": "app=$app$ "   },
+    { "id": "sangfor-proto", "format": "proto=$proto$ " },
+    { "id": "sangfor-suser", "format": "suser=$suser$ " },
+    { "id": "sangfor-spt",   "format": "spt=$spt$ "   },
+    { "id": "sangfor-dpt",   "format": "dpt=$dpt$ "   },
+    { "id": "sangfor-out",   "format": "out=$out$ "   },
+    { "id": "sangfor-in",    "format": "in=$in$ "     }
+  ]
 }
-SRCEOF
-    log "Empty sources.json created at $BASE_INSTALL/config/sources.json"
-  fi
-
-  if [[ -d "$REPO_ROOT/scripts" ]]; then
-    mkdir -p "$BASE_INSTALL/scripts"
-    cp -r "$REPO_ROOT/scripts/." "$BASE_INSTALL/scripts/"
-    chmod +x "$BASE_INSTALL/scripts/"*.sh 2>/dev/null || true
-    log "scripts/ installed to $BASE_INSTALL/scripts/"
-  else
-    warn "scripts/ not found — manage-sources.sh will not be available"
-  fi
-
-  if [[ -d "$REPO_ROOT/integrations" ]]; then
-    mkdir -p "$BASE_INSTALL/integrations"
-    cp -r "$REPO_ROOT/integrations/." "$BASE_INSTALL/integrations/"
-    log "integrations/ installed to $BASE_INSTALL/integrations/"
-  else
-    warn "integrations/ not found — parser files will not be available"
-  fi
-
-  # Add sudoers entries so backend can run manage-sources.sh and restart agent
-  SUDOERS_FILE="/etc/sudoers.d/secbridge"
-  if [[ ! -f "$SUDOERS_FILE" ]]; then
-    cat > "$SUDOERS_FILE" <<EOF
-# SecBridge Web UI — allow backend to manage sources and restart agent
-root ALL=(ALL) NOPASSWD: /bin/bash $BASE_INSTALL/scripts/manage-sources.sh
-www-data ALL=(ALL) NOPASSWD: /bin/bash $BASE_INSTALL/scripts/manage-sources.sh
-root ALL=(ALL) NOPASSWD: /bin/systemctl restart scalyr-agent-2
-www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart scalyr-agent-2
-EOF
-    chmod 440 "$SUDOERS_FILE"
-    log "sudoers entry created: $SUDOERS_FILE"
-  fi
-
-  log "Files installed to $INSTALL_DIR"
-}
-
-# ── Create systemd service — Backend ─────────────────────────────────────
-install_backend_service() {
-  title "Creating SecBridge Service"
-
-  UVICORN_BIN=$(command -v uvicorn || echo "uvicorn")
-
-  cat > /etc/systemd/system/secbridge.service <<EOF
-[Unit]
-Description=SecBridge Web UI + API
-After=network.target
-Wants=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$UVICORN_BIN backend:app --host 0.0.0.0 --port $UI_PORT
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=secbridge
-
-[Install]
-WantedBy=multi-user.target
 EOF
 
-  log "secbridge.service created (port $UI_PORT — serves UI + API together)."
+  log "Parser config created: $PARSER_CONFIG_FILE"
+
+  # Also copy into Scalyr configs.d so agent picks it up
+  cp "$PARSER_CONFIG_FILE" "$PARSER_DIR/sangfor-ngaf-parser.json"
+  log "Parser config deployed to $PARSER_DIR"
 }
 
-# (Frontend is served by FastAPI — no separate UI service needed)
-
-# ── Open firewall ports ───────────────────────────────────────────────────
-open_ports() {
-  title "Opening Firewall Ports"
+# ── Firewall ──────────────────────────────────────────────────────────────
+open_firewall_port() {
+  info "Opening firewall port $SYSLOG_PORT (UDP + TCP)..."
 
   case "$OS" in
     ubuntu)
       if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow $UI_PORT/tcp >> "$LOG_FILE" 2>&1
-        log "UFW: port $UI_PORT opened."
+        ufw allow "$SYSLOG_PORT"/udp >> "$LOG_FILE" 2>&1
+        ufw allow "$SYSLOG_PORT"/tcp >> "$LOG_FILE" 2>&1
+        log "UFW: port $SYSLOG_PORT opened."
       else
-        warn "UFW not active — open port $UI_PORT manually if needed."
+        warn "UFW not active — open port $SYSLOG_PORT manually if needed."
       fi
       ;;
     rocky|rhel|centos|almalinux)
       if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
-        firewall-cmd --permanent --add-port=$UI_PORT/tcp >> "$LOG_FILE" 2>&1
+        firewall-cmd --permanent --add-port="$SYSLOG_PORT"/udp >> "$LOG_FILE" 2>&1
+        firewall-cmd --permanent --add-port="$SYSLOG_PORT"/tcp >> "$LOG_FILE" 2>&1
         firewall-cmd --reload >> "$LOG_FILE" 2>&1
-        log "firewalld: port $UI_PORT opened."
+        log "firewalld: port $SYSLOG_PORT opened."
       else
-        warn "firewalld not active — open port manually if needed."
+        warn "firewalld not active — open port $SYSLOG_PORT manually if needed."
       fi
       ;;
   esac
 }
 
-# ── Start services ────────────────────────────────────────────────────────
-start_services() {
-  title "Starting Services"
+# ── Agent start ───────────────────────────────────────────────────────────
+start_agent() {
+  info "Enabling and starting Scalyr Agent..."
+  # Create systemd service if missing
+  if [[ ! -f /etc/systemd/system/scalyr-agent-2.service ]]; then
+    info "Creating systemd service..."
+    cat > /etc/systemd/system/scalyr-agent-2.service <<'SVCEOF'
+[Unit]
+Description=SentinelOne Collector (Scalyr Agent 2)
+After=network.target
 
-  systemctl daemon-reload
+[Service]
+Type=forking
+ExecStart=/sbin/scalyr-agent-2 start
+ExecStop=/sbin/scalyr-agent-2 stop
+ExecReload=/sbin/scalyr-agent-2 restart
+Restart=on-failure
+RestartSec=5
 
-  systemctl enable secbridge >> "$LOG_FILE" 2>&1
-  systemctl restart secbridge
-  sleep 3
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+    systemctl daemon-reload >> "$LOG_FILE" 2>&1
+    log "systemd service created."
+  fi
 
-  if systemctl is-active --quiet secbridge; then
-    log "secbridge running on port $UI_PORT (UI + API combined)"
+  systemctl enable scalyr-agent-2 >> "$LOG_FILE" 2>&1
+  systemctl restart scalyr-agent-2 >> "$LOG_FILE" 2>&1
+  sleep 5
+
+  if systemctl is-active --quiet scalyr-agent-2; then
+    log "Scalyr Agent is running."
   else
-    error "secbridge failed to start. Check: journalctl -u secbridge -n 30"
+    error "Agent failed to start. Run: journalctl -u scalyr-agent-2 -n 50"
   fi
 }
 
-# ── Done ──────────────────────────────────────────────────────────────────
-print_done() {
+verify_port_listening() {
+  info "Verifying listener on port $SYSLOG_PORT..."
+  sleep 2
+  if ss -ulnp 2>/dev/null | grep -q ":${SYSLOG_PORT}[[:space:]]" || \
+     ss -tlnp 2>/dev/null | grep -q ":${SYSLOG_PORT}[[:space:]]"; then
+    log "Confirmed: listening on port $SYSLOG_PORT"
+  else
+    warn "Port not yet visible in ss — may take a few seconds to bind."
+  fi
+}
+
+# ── Summary ───────────────────────────────────────────────────────────────
+print_next_steps() {
   local MY_IP; MY_IP=$(get_local_ip)
+
   echo ""
   echo "============================================================"
-  echo -e "${GREEN}  WEB UI INSTALL COMPLETE${NC}"
+  echo -e "${GREEN}  INSTALL COMPLETE — v3.1${NC}"
   echo "============================================================"
   echo ""
-  echo "  Open in browser:"
-  echo -e "  ${CYAN}http://$MY_IP:$UI_PORT${NC}"
+  echo "  Files created:"
+  echo "    $PARSER_CONFIG_FILE"
+  echo "    $PARSER_DIR/sangfor-ngaf-parser.json"
+  echo "    $AGENT_CONF"
   echo ""
-  echo "  Default login:  admin / admin"
+  echo "  STEP 1 — Deploy parser service:"
+  echo "    sudo bash $(cd "$(dirname "$0")" && pwd)/deploy-parser.sh"
   echo ""
-  echo "  Service (UI + API combined):"
-  echo "    systemctl status secbridge"
-  echo "    journalctl -u secbridge -f"
+  echo "  STEP 2 — Configure Sangfor NGAF syslog:"
+  echo "    NGAF v6.5+: System → Logging Options → Syslog Server tab"
+  echo "    NGAF v6.4-: System → Logging Options → Syslog → Enable"
+  echo ""
+  echo "    Destination IP : $MY_IP"
+  echo "    Port           : $SYSLOG_PORT"
+  echo ""
+  echo "  STEP 3 — Create 'sangfor-ngaf' parser in SentinelOne SDL console"
+  echo "           (rules documented in docs/README.md)"
+  echo ""
+  echo "  Verify:"
+  echo "    sudo scalyr-agent-2 status"
+  echo "    sudo tail -f /var/log/scalyr-agent-2/sangfor-ngaf.log"
+  echo "    sudo bash $(cd "$(dirname "$0")" && pwd)/test-syslog.sh $MY_IP $SYSLOG_PORT"
   echo ""
   echo "  Install log: $LOG_FILE"
   echo ""
@@ -260,15 +328,25 @@ print_done() {
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
-init_log
+init_logfile   # must be first — ensures tee -a never fails under set -e
 banner
 check_root
 detect_os
-install_deps
-install_python_deps
-install_files
-build_frontend
-install_backend_service
-open_ports
-start_services
-print_done
+prompt_credentials
+
+case "$OS" in
+  ubuntu)
+    install_deps_ubuntu ;;
+  rocky|rhel|centos|almalinux)
+    install_deps_rocky ;;
+  *)
+    error "Unsupported OS: $OS. Use Ubuntu 22.04/24.04 or Rocky Linux 9." ;;
+esac
+
+install_scalyr_agent
+configure_agent
+create_parser_config   # BUG1 FIX: replaces old deploy_parser_config()
+open_firewall_port
+start_agent
+verify_port_listening
+print_next_steps
